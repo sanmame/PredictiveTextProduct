@@ -1,0 +1,292 @@
+---
+title: "Data Science Capstone - Milestone report for the predictive text product"
+author: "Melania S. Masia"
+date: "1/10/2020"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message = FALSE, warning=FALSE)
+```
+
+## 1. Project overview
+The purpose of this project is to create a predictive text product. The model will make typing on mobile devices easier by providing the choices with the highest probability to be typed by a user given the previous words and context of the sentence. The final data product will be a shiny app.
+
+## 2. Data
+The data used to train the model consists of a corpus of texts collected from publicly available sources by a web crawler in 4 languages (English, German, French and Russian). Each entry is tagged with the type of entry, based on the type of website it is collected from (e.g. newspaper or personal blog). Once the raw corpus was collected, it was parsed further, to remove duplicate entries and split into individual lines. The entries are anonymised. The final corpus is divided into blogs, news, and twitter source files and can be downloaded from [this site](https://web-beta.archive.org/web/20160930083655/http://www.corpora.heliohost.org/aboutcorpus.html).
+
+### 2.1 Download and unzip the data
+```{r}
+if (!file.exists("Coursera-SwiftKey.zip")){
+  download.file(url = "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip", destfile = "Coursera-SwiftKey.zip", quiet = FALSE, method="auto")}
+
+if (!file.exists("final")){
+  unzip(zipfile = "Coursera-SwiftKey.zip", overwrite = TRUE)
+}
+```
+
+### 2.2 Read the files
+
+```{r}
+language = 'en_US' # ('de_DE','en_US','fi_FI','ru_RU')
+sources = c('blogs','news','twitter')
+
+rdata = list()
+for (src in sources){
+  path = file.path("final", language, paste(language,".",src,".txt",sep = "") )
+  rdata[[src]] = readLines(path, encoding = 'UTF-8', skipNul = TRUE)
+}
+```
+
+### 2.3 Basic file summaries
+```{r}
+require(stringi)
+require(knitr)
+blogs_stats   <- stri_stats_general(rdata$blogs)
+news_stats    <- stri_stats_general(rdata$news)
+twitter_stats <- stri_stats_general(rdata$twitter)
+stats <- data.frame(blogs_stats, news_stats, twitter_stats)
+size <- list(blogs_stats=format(object.size(rdata$blogs), units="MB"), news_stats=format(object.size(rdata$news), units="MB"), twitter_stats=format(object.size(rdata$twitter), units="MB"))
+longest_line <- list(blogs_stats=max(nchar(rdata$blogs)), news_stats=max(nchar(rdata$news)), twitter_stats=max(nchar(rdata$twitter)))
+stats2 <- rbind(size, stats, longest_line)
+
+row.names(stats2) <- c("Size", "Lines", "Non-empty lines", "Characters", "Non-white Characters", "Longest Line")
+names(stats2) <- c("Blogs", "News", "Twitter")
+
+kable(stats2, caption="File statistics")
+```
+
+## 3. Data Clean-up
+### 3.1 Corpus creation
+Since the size of the data is big, it is resampled to a .3% of it to improve the code performance. We use `{rbinom}` to determine the lines of text to sample.
+
+```{r}
+require(tm)
+df.blogs <- rdata$blogs[as.logical(rbinom(length(rdata$blogs),1, prob=0.003))]
+df.news <- rdata$news[as.logical(rbinom(length(rdata$news),1, prob=0.003))]
+df.twitter <- rdata$twitter[as.logical(rbinom(length(rdata$twitter),1, prob=0.003))]
+
+corpus = VCorpus(VectorSource(c(df.blogs,df.news,df.twitter)))
+
+#remove previous objects to free up memory
+rm(rdata)
+rm(df.blogs)
+rm(df.news)
+rm(df.twitter)
+```
+
+### 3.2 Clean-up
+We first remove special characters and punctuation, change to lower case and strip white characters using the tm package.
+
+```{r}
+# Helper functions
+removeHashTags <- function(x) gsub("#\\S+", "", x)
+removeTwitterHandles <- function(x) gsub("@\\S+", "", x)
+removeURL <- function(x) gsub("http:[[:alnum:]]*", "", x)
+removeSpecialChars <- function(x) gsub("[^a-zA-Z0-9 ]","",x)
+
+# Remove handles and hashtags from the Twitter texts
+corpus["en_US.twitter.txt"] = tm_map(corpus["en_US.twitter.txt"], removeHashTags)
+corpus["en_US.twitter.txt"] = tm_map(corpus["en_US.twitter.txt"], removeTwitterHandles)
+
+# Data clean-up for the whole corpus
+corpus = tm_map(corpus, tolower)
+corpus = tm_map(corpus, removeURL)
+corpus = tm_map(corpus, removeSpecialChars)
+corpus = tm_map(corpus, removeNumbers)
+corpus = tm_map(corpus, removePunctuation)
+corpus = tm_map(corpus, stripWhitespace)
+corpus = tm_map(corpus, PlainTextDocument)
+```
+
+We then remove profanity to filter words we don't want to predict.
+
+```{r}
+if (!file.exists("profanity.txt")) {
+        download.file(url = "http://www.bannedwordlist.com/lists/swearWords.txt", 
+                      destfile = "profanity.txt", quiet = FALSE, method="auto")
+        }
+profanity <- readLines("profanity.txt", skipNul = TRUE, warn = FALSE)
+corpus = tm_map(corpus, removeWords, profanity)
+```
+
+## 4. Exploratory data analysis
+In this section, we perform a thorough exploratory analysis of the data in order to understand the distribution of words and relationship between the words in the corpora.
+
+### 4.1 Word and word combination frequencies
+N-grams are created from the data. An N-gram is a group of words that appear in order, with the n value representing how many words are used. For example, 'I' is a 1-gram, 'I don't' is a 2-gram and 'I don't know' is a 3-gram.
+
+The benefit of using n-grams is that they provide more context on how sentences are created out of words, thus allowing for a better prediction model.
+
+We first create the n-grams by tokenizing the corpus and then create TermDocumenMatrix using `{tm}`. A TermDocumentMatrix is a matrix where the rows are he tokens and columns are the datasets. Each cell in this matrix represents the frequencies of the tokens in the datasets.
+
+```{r}
+require(RWeka)
+unigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min=1, max=1))
+bigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min=2, max=2))
+trigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min=3, max=3))
+
+uniTDM <- TermDocumentMatrix(corpus, control=list(tokenize=unigramTokenizer))
+biTDM <- TermDocumentMatrix(corpus, control=list(tokenize=bigramTokenizer))
+triTDM <- TermDocumentMatrix(corpus, control=list(tokenize=trigramTokenizer))
+```
+
+Now we create dataframes containing the 1-, 2- and 3-grams and their frequencies are created and sorted according to the frequencies.
+
+```{r}
+freqTDM <- function(tdm) {
+  m <- as.matrix(tdm)
+  ngram_sums <- rowSums(m)
+  ngram_freq <- sort(ngram_sums, decreasing=TRUE)
+  return(data.frame(words=names(ngram_freq), frequency=ngram_freq, row.names = c()))
+}
+uni_df <- freqTDM(uniTDM)
+bi_df <- freqTDM(biTDM)
+tri_df <- freqTDM(triTDM)
+```
+
+#### 4.2.1 Plots
+The plots below show the 20 most common 1-, 2- and 3-Grams.
+
+```{r }
+require(ggplot2)
+# Unigrams
+ggplot(uni_df[1:20,], aes(reorder(words, frequency), frequency)) +
+  geom_text(aes(label = uni_df[1:20,]$frequency), vjust=-0.5, size=3) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, size = 10)) +
+  labs(x="1-gram Tokens") + 
+  labs(y="Frequency") +
+  labs(title="Frequency of 1-gram tokens")
+# Bigrams
+ggplot(bi_df[1:20,], aes(reorder(words, frequency), frequency)) +
+  geom_text(aes(label = bi_df[1:20,]$frequency), vjust=-0.5, size=3) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, size = 10)) +
+  labs(x="2-gram Tokens") + 
+  labs(y="Frequency") +
+  labs(title="Frequency of 2-gram tokens")
+# Trigrams
+ggplot(tri_df[1:20,], aes(reorder(words, frequency), frequency)) +
+  geom_text(aes(label = tri_df[1:20,]$frequency), vjust=-0.5, size=3) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, size = 10)) +
+  labs(x="3-gram Tokens") + 
+  labs(y="Frequency") +
+  labs(title="Frequency of 3-gram tokens")
+```
+
+#### 4.2.2 Word Clouds
+The word clouds below show the 25 most common 1-, 2- and 3-grams.
+
+```{r }
+require(wordcloud)
+#unigrams
+wordcloud(words = uni_df[1:25,]$words, 
+          freq = uni_df[1:25,]$frequency,
+          random.order=FALSE,scale=c(5,0.5),
+          colors=brewer.pal(8, "Dark2"),
+          main="Frequency of 1-gram tokens")
+#bigrams
+wordcloud(words = bi_df[1:25,]$words, 
+          freq = bi_df[1:25,]$frequency,
+          random.order=FALSE, scale=c(3.5,0.25),
+          colors=brewer.pal(8, "Dark2"),
+          main="Frequency of 2-gram tokens")
+#trigrams
+wordcloud(words = tri_df[1:25,]$words, 
+          freq = tri_df[1:25,]$frequency,
+          random.order=FALSE, scale=c(3.5,0.25),
+          colors=brewer.pal(8, "Dark2"),
+          main="Frequency of 3-gram tokens")
+```
+
+### 4.3 Unique words
+In this section, we calculate the number of unique words needed in a frequency sorted dictionary to cover 50% and 90% of all word instances in the language. We assume that the sample dataset represents the corpus of the entire language. 
+
+```{r }
+word_coverage <- function(df, cover_percent) {
+  unique_words = 0
+  coverage <- cover_percent * sum(df$frequency)
+  for (i in 1:nrow(df)) {
+    if (unique_words >= coverage) {
+      return (i)
+      }
+    unique_words <-unique_words + df$frequency[i]
+  }
+  }
+
+token_percent <- function(df,cover_percent) {
+  return(round((word_coverage(df,cover_percent)*100)/sum(df$frequency),2))
+}
+
+word_coverage_df <- data.frame(
+  "coverage" = c("50%", "90%"),
+  "unique words" = c(word_coverage(uni_df,0.5),word_coverage(uni_df,0.9)),
+  "percentage of total tokens" = c(token_percent(uni_df,0.5),token_percent(uni_df,0.9)))
+names(word_coverage_df) <- c("Coverage", "Unique words", "Percentage of total tokens")
+kable(word_coverage_df)
+```
+
+From the table, we can observe that a 50% coverage is achieved with `r token_percent(uni_df,0.5)`% and the 90% coverage is achieved with `r token_percent(uni_df,0.9)`% of total words.
+
+### 4.4 Percentage of foreign words
+In this section, we calculate the number of non-English or foreign words in the corpus. We use single tokens and the Compact Language Detector package from the cldr library, which supplies a way to detect the language of words in a corpus.
+
+```{r }
+require(cld2)
+require(dplyr)
+uni_df$words <- lapply(uni_df$words, as.character)
+language_detected <- lapply(uni_df$words, detect_language_mixed)
+
+languages = list()
+reliability = list()
+for (i in 1:nrow(uni_df)) {
+  new_element <- language_detected[[i]]$classificaton[1,"language"]
+  new_value <- language_detected[[i]]$reliabale
+  languages = c(languages, new_element)
+  reliability = c(reliability, new_value)
+}
+token_language <- mutate(uni_df, detected_language = languages, reliability = reliability)
+token_language$reliability <- as.logical(token_language$reliability)
+# remove rows with "unknown" values
+token_language <- filter(token_language, token_language$detected_language != "UNKNOWN")
+# take only rows with the first language option being more probable than the second by some amount (reliability)
+token_language <- filter(token_language, token_language$reliability == TRUE)
+english_words <- filter(token_language, token_language$detected_language == "ENGLISH")
+foreign_words <- filter(token_language, token_language$detected_language != "ENGLISH")
+
+#calculate frequencies for English and non-English words
+english_words_freq <- sum(english_words$frequency)
+foreign_words_freq <- sum(foreign_words$frequency)
+total_freq <- sum(token_language$frequency)
+english_words_percent <- english_words_freq*100/total_freq
+foreign_words_percent <- foreign_words_freq*100/total_freq
+
+# create data frame
+language_df <- data.frame(
+  "language" = c("English", "Non-English"),
+  "number of words" = c(english_words_freq, foreign_words_freq),
+  "percentage" = c(english_words_percent, foreign_words_percent),
+  "number of unique words" = c(nrow(english_words), nrow(foreign_words)),
+  "percentage of unique words" = c(nrow(english_words)*100/nrow(token_language),
+                                   nrow(foreign_words)*100/nrow(token_language))
+)
+names(language_df) <- c("Language", "Number of words", "Percentage", "Number of unique words", "Percentage of unique words")
+kable(language_df)
+
+```
+
+The corpus contains a `r foreign_words_freq*100/total_freq` % of foreign words. Since this percentage is small, the presence of foreign words in the corpus will not impact the prediction algorithm in a significant manner and we can keep them.
+
+### 4.5 Increasing coverage
+There are several ways of increasing coverage. On the word level, common misspellings (e.g., 'wich' instead of 'which') could be substituted in the corpus. The number of words in the dictionary could be reduced by replacing them using a thesaurus. In addition, not removing profanity could increase coverage, especially for some text types. On the text level, separating the corpus into text types (twitter, blogs and news) would improve the coverage for a specific type of text. The text prediction for writing tweets would be better if only tweets were used to train the model.
+
+## 5. Future plans
+The algorithm should be optimized to use the lower amount of resources (computing time and memory usage). Predictive text models can run on mobile phones, which typically have limited memory and processing power compared to desktop computers. The previous analysis shows that a reduced quantity of words can be used to get a decent coverage. 
+
+The predictive algorithm could be based on the previous n-gram models, although other options will be explored.
+
+The App will consist of a text input for the user and an output box to show the text predicted by the algorithm.
